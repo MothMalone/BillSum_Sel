@@ -105,9 +105,9 @@ class MemoryOptimizedPEFTTrainer:
         
         # Optimized settings for high-end GPU
         self.config = {
-            "max_length": 2048,          # Increased for better context
-            "batch_size": 2,             # Larger batch size
-            "gradient_accumulation": 4,  # Reduced accumulation
+            "max_length": 1024,          # Reduced for stability
+            "batch_size": 1,             # Conservative batch size
+            "gradient_accumulation": 8,  # Increased accumulation
             "learning_rate": 2e-4,
             "num_epochs": 1,             # Single epoch for efficiency
             "lora_r": 16,                # Higher LoRA rank for better quality
@@ -199,38 +199,40 @@ class MemoryOptimizedPEFTTrainer:
             prompt = f"<s>[INST] Summarize the following bill in a concise manner:\n\n{text}\n\nProvide a brief summary: [/INST]"
             target = f"{summary}</s>"
             
-            # Tokenize
-            model_inputs = self.tokenizer(
+            # Combine full text
+            full_text = prompt + target
+            
+            # Tokenize the full sequence
+            tokenized = self.tokenizer(
+                full_text,
+                max_length=self.config["max_length"],
+                truncation=True,
+                padding=False,
+                return_tensors=None
+            )
+            
+            # Create labels (only train on the summary part)
+            prompt_tokenized = self.tokenizer(
                 prompt,
-                max_length=self.config["max_length"] - 100,  # Reserve space for summary
+                max_length=self.config["max_length"],
                 truncation=True,
                 padding=False,
                 return_tensors=None
             )
             
-            # Tokenize target
-            target_inputs = self.tokenizer(
-                target,
-                max_length=100,
-                truncation=True,
-                padding=False,
-                return_tensors=None
-            )
+            input_ids = tokenized["input_ids"]
+            labels = [-100] * len(prompt_tokenized["input_ids"]) + input_ids[len(prompt_tokenized["input_ids"]):]
             
-            # Combine input and target
-            input_ids = model_inputs["input_ids"] + target_inputs["input_ids"]
-            labels = [-100] * len(model_inputs["input_ids"]) + target_inputs["input_ids"]
-            
-            # Pad/truncate to max_length
-            max_len = self.config["max_length"]
-            if len(input_ids) > max_len:
-                input_ids = input_ids[:max_len]
-                labels = labels[:max_len]
+            # Ensure labels and input_ids have same length
+            if len(labels) > len(input_ids):
+                labels = labels[:len(input_ids)]
+            elif len(labels) < len(input_ids):
+                labels.extend([-100] * (len(input_ids) - len(labels)))
             
             return {
                 "input_ids": input_ids,
                 "labels": labels,
-                "attention_mask": [1] * len(input_ids)
+                "attention_mask": tokenized["attention_mask"]
             }
         
         formatted_dataset = dataset.map(format_sample, remove_columns=dataset.column_names)
@@ -270,10 +272,12 @@ class MemoryOptimizedPEFTTrainer:
                 run_name=f"{method_name}_peft_training"
             )
             
-            # Data collator
-            data_collator = DataCollatorForLanguageModeling(
+            # Data collator with proper padding
+            from transformers import DataCollatorForSeq2Seq
+            data_collator = DataCollatorForSeq2Seq(
                 tokenizer=self.tokenizer,
-                mlm=False,
+                model=self.model,
+                label_pad_token_id=-100,
                 pad_to_multiple_of=8
             )
             
@@ -626,8 +630,8 @@ def run_production_experiment():
         return False
     
     # Experiment configuration for high-end GPU
-    n_train_samples = 200  # Increased for better training
-    n_eval_samples = 50    # More evaluation samples
+    n_train_samples = 50   # Start smaller for testing
+    n_eval_samples = 20    # Reduced for faster testing
     
     # Data selection methods
     methods = [
