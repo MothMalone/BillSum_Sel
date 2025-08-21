@@ -1,4 +1,6 @@
-# BillSum Knowledge Distillation - Vast.ai Production Guide
+# BillSum1. **GPU Requirements**: 
+   - Minimum: 24GB VRAM (RTX 4090, A6000, etc.)
+   - Recommended: 40GB+ VRAM (A100, H100, etc.)owledge Distillation - Vast.ai Production Guide
 
 ## 🚀 Quick Start for Vast.ai
 
@@ -203,10 +205,10 @@ If you encounter issues:
 - BF16 precision for memory and speed
 
 ### Model Configuration
-- Base model: `microsoft/DialoGPT-medium` (memory efficient)
-- LoRA rank: 8, alpha: 32
-- Max sequence length: 1024 tokens
-- Batch size: 1 with 8x gradient accumulation
+- Base model: `meta-llama/Llama-2-7b-hf` (high-quality LLM)
+- LoRA rank: 16, alpha: 32
+- Max sequence length: 2048 tokens
+- Batch size: 2 with 4x gradient accumulation
 
 ### Data Selection Methods
 1. **Random**: Baseline random sampling

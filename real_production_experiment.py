@@ -96,21 +96,21 @@ def load_dataset():
         return None, None
 
 class MemoryOptimizedPEFTTrainer:
-    """Memory-optimized PEFT trainer for 16GB GPU constraints."""
+    """Memory-optimized PEFT trainer for high-end GPU."""
     
-    def __init__(self, base_model_name: str = "microsoft/DialoGPT-medium"):
+    def __init__(self, base_model_name: str = "meta-llama/Llama-2-7b-hf"):
         self.base_model_name = base_model_name
         self.model = None
         self.tokenizer = None
         
-        # Memory-optimized settings
+        # Optimized settings for high-end GPU
         self.config = {
-            "max_length": 1024,          # Reduced from 2048
-            "batch_size": 1,             # Very small batch
-            "gradient_accumulation": 8,  # Accumulate to simulate larger batch
+            "max_length": 2048,          # Increased for better context
+            "batch_size": 2,             # Larger batch size
+            "gradient_accumulation": 4,  # Reduced accumulation
             "learning_rate": 2e-4,
             "num_epochs": 1,             # Single epoch for efficiency
-            "lora_r": 8,                 # LoRA rank
+            "lora_r": 16,                # Higher LoRA rank for better quality
             "lora_alpha": 32,
             "lora_dropout": 0.1,
             "bf16": True,                # Use bf16 for memory efficiency
@@ -143,6 +143,8 @@ class MemoryOptimizedPEFTTrainer:
             self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_name)
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
+            # Add padding side for training  
+            self.tokenizer.padding_side = "right"
             
             # Load model with quantization
             self.model = AutoModelForCausalLM.from_pretrained(
@@ -153,13 +155,18 @@ class MemoryOptimizedPEFTTrainer:
                 trust_remote_code=True
             )
             
-            # Setup LoRA
+            # Prepare model for k-bit training (required for quantized models)
+            from peft import prepare_model_for_kbit_training
+            self.model = prepare_model_for_kbit_training(self.model)
+            
+            # Setup LoRA for LLaMA-2
             lora_config = LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
                 r=self.config["lora_r"],
                 lora_alpha=self.config["lora_alpha"],
                 lora_dropout=self.config["lora_dropout"],
-                target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+                target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                bias="none"
             )
             
             self.model = get_peft_model(self.model, lora_config)
@@ -184,13 +191,13 @@ class MemoryOptimizedPEFTTrainer:
             text = example.get('text', '').strip()
             summary = example.get('summary', '').strip()
             
-            # Truncate text if too long
-            text_words = text.split()[:300]  # Limit to ~300 words
+            # Truncate text if too long (increased for LLaMA-2)
+            text_words = text.split()[:500]  # Limit to ~500 words for better context
             text = ' '.join(text_words)
             
-            # Create instruction format
-            prompt = f"Summarize the following bill:\n\n{text}\n\nSummary:"
-            target = f"{summary}"
+            # Create instruction format for LLaMA-2
+            prompt = f"<s>[INST] Summarize the following bill in a concise manner:\n\n{text}\n\nProvide a brief summary: [/INST]"
+            target = f"{summary}</s>"
             
             # Tokenize
             model_inputs = self.tokenizer(
@@ -331,7 +338,7 @@ class MemoryOptimizedPEFTTrainer:
 class ProductionEvaluator:
     """Production evaluator using actual model inference."""
     
-    def __init__(self, base_model_name: str = "microsoft/DialoGPT-medium"):
+    def __init__(self, base_model_name: str = "meta-llama/Llama-2-7b-hf"):
         self.base_model_name = base_model_name
         self.model = None
         self.tokenizer = None
@@ -357,6 +364,8 @@ class ProductionEvaluator:
             self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_name)
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
+            # Set padding side for inference
+            self.tokenizer.padding_side = "left"
             
             # Load base model
             base_model = AutoModelForCausalLM.from_pretrained(
@@ -381,11 +390,11 @@ class ProductionEvaluator:
     def generate_summary(self, text: str) -> str:
         """Generate summary using the trained model."""
         try:
-            prompt = f"Summarize the following bill:\n\n{text}\n\nSummary:"
+            prompt = f"<s>[INST] Summarize the following bill in a concise manner:\n\n{text}\n\nProvide a brief summary: [/INST]"
             
             inputs = self.tokenizer(
                 prompt,
-                max_length=800,
+                max_length=1200,         # Increased input length
                 truncation=True,
                 return_tensors="pt"
             ).to(self.model.device)
@@ -393,7 +402,7 @@ class ProductionEvaluator:
             with torch.no_grad():
                 outputs = self.model.generate(
                     **inputs,
-                    max_new_tokens=150,
+                    max_new_tokens=200,      # Increased output length
                     do_sample=True,
                     temperature=0.7,
                     top_p=0.9,
@@ -403,11 +412,14 @@ class ProductionEvaluator:
             # Decode output
             generated = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
             
-            # Extract summary (after "Summary:")
-            if "Summary:" in generated:
-                summary = generated.split("Summary:")[-1].strip()
+            # Extract summary (after [/INST])
+            if "[/INST]" in generated:
+                summary = generated.split("[/INST]")[-1].strip()
             else:
                 summary = generated[len(prompt):].strip()
+            
+            # Remove any trailing </s> tokens
+            summary = summary.replace("</s>", "").strip()
             
             return summary
             
@@ -613,9 +625,9 @@ def run_production_experiment():
         logger.error("❌ Failed to load dataset")
         return False
     
-    # Experiment configuration
-    n_train_samples = 100  # Small for demonstration
-    n_eval_samples = 20
+    # Experiment configuration for high-end GPU
+    n_train_samples = 200  # Increased for better training
+    n_eval_samples = 50    # More evaluation samples
     
     # Data selection methods
     methods = [
