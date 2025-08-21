@@ -24,19 +24,17 @@ cd billsum_sel
 
 ### Option 2: Manual Setup
 ```bash
-# 1. Copy environment template
-cp .env.template .env
-
-# 2. Edit .env with your tokens
-# HF_TOKEN=hf_your_token_here
-# WANDB_API_KEY=your_wandb_key_here (optional)
-
-# 3. Install dependencies
+# 1. Install dependencies
 pip install -r requirements.txt
 
-# 4. Validate setup
+# 2. Run validation (will prompt for tokens)
 python main.py --mode validate
+
+# 3. Start experimenting!
+python main.py --mode quick
 ```
+
+**🔐 Security Note**: Tokens are requested interactively and stored only in your session - never saved to files or committed to git!
 
 ## ⚡ Experiment Modes
 

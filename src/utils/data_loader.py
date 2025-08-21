@@ -23,18 +23,30 @@ class BillSumLoader:
         logger.info(f"Loading BillSum from {self.dataset_path}")
         
         try:
-            # Load with authentication
+            # Load with authentication using newer token parameter
             auth_token = os.getenv("HF_TOKEN")
             if not auth_token:
                 logger.warning("No HF_TOKEN found, trying without authentication")
                 auth_token = None
             
-            dataset = load_dataset(
-                self.dataset_path, 
-                name="billsum",
-                cache_dir=self.cache_dir,
-                use_auth_token=auth_token
-            )
+            # Try with newer 'token' parameter first
+            try:
+                dataset = load_dataset(
+                    self.dataset_path, 
+                    name="billsum",
+                    cache_dir=self.cache_dir,
+                    token=auth_token
+                )
+            except (TypeError, ValueError) as e:
+                # Fallback to older 'use_auth_token' parameter if needed
+                logger.warning(f"Newer 'token' parameter failed: {e}")
+                logger.info("Trying with legacy 'use_auth_token' parameter...")
+                dataset = load_dataset(
+                    self.dataset_path, 
+                    name="billsum",
+                    cache_dir=self.cache_dir,
+                    use_auth_token=auth_token
+                )
             
             # Validate splits exist
             available_splits = list(dataset.keys())

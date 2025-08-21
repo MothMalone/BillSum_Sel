@@ -30,27 +30,77 @@ class QuickEmbeddingSelector:
     """Embedding-based selection using SAME model as training for consistency."""
     
     def __init__(self, model_name: str = "meta-llama/Llama-2-7b-hf", use_training_model: bool = True):
-        if not SENTENCE_TRANSFORMERS_AVAILABLE:
-            raise ImportError("sentence-transformers is required for embedding-based selection")
+        self.model_name = model_name
+        self.use_training_model = use_training_model
         
-        # Critical: Use same model family as training for consistent representations
         if use_training_model:
-            # Map training models to compatible sentence transformer models
-            model_mapping = {
-                "meta-llama/Llama-2-7b-hf": "sentence-transformers/all-mpnet-base-v2",  # Best general purpose
-                "meta-llama/Llama-2-13b-hf": "sentence-transformers/all-mpnet-base-v2", 
-                "facebook/opt-6.7b": "sentence-transformers/all-roberta-large-v1",
-                "microsoft/DialoGPT-medium": "sentence-transformers/all-MiniLM-L12-v2",
-                "gpt2-xl": "sentence-transformers/all-MiniLM-L12-v2"
-            }
-            embedding_model = model_mapping.get(model_name, "sentence-transformers/all-mpnet-base-v2")
-            logger.info(f"Using embedding model {embedding_model} for consistency with training model {model_name}")
+            logger.info(f"Using training model {model_name} for embeddings (CONSISTENT)")
+            self.model = None  # Will load when needed
+            self.tokenizer = None
         else:
-            embedding_model = model_name
-        
-        logger.info(f"Loading sentence transformer: {embedding_model}")
-        self.model = SentenceTransformer(embedding_model)
-        self.training_model_name = model_name
+            if not SENTENCE_TRANSFORMERS_AVAILABLE:
+                raise ImportError("sentence-transformers is required for embedding-based selection")
+            # Fallback to sentence transformers (less consistent)
+            logger.warning(f"Using sentence-transformers instead of training model - may be inconsistent!")
+            self.embedding_model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
+    
+    def _get_training_model_embeddings(self, texts: List[str]) -> np.ndarray:
+        """Get embeddings using the actual training model for consistency."""
+        try:
+            from transformers import AutoTokenizer, AutoModel
+            import torch
+            
+            if self.model is None:
+                logger.info(f"Loading training model for embeddings: {self.model_name}")
+                self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+                self.model = AutoModel.from_pretrained(
+                    self.model_name,
+                    torch_dtype=torch.float16,
+                    device_map="auto"
+                )
+                if self.tokenizer.pad_token is None:
+                    self.tokenizer.pad_token = self.tokenizer.eos_token
+                    
+            embeddings = []
+            batch_size = 8  # Small batches to avoid memory issues
+            
+            for i in range(0, len(texts), batch_size):
+                batch_texts = texts[i:i+batch_size]
+                
+                # Tokenize
+                inputs = self.tokenizer(
+                    batch_texts,
+                    padding=True,
+                    truncation=True,
+                    max_length=512,
+                    return_tensors="pt"
+                )
+                inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+                
+                # Get embeddings
+                with torch.no_grad():
+                    outputs = self.model(**inputs)
+                    # Use mean pooling of last hidden states
+                    embeddings_batch = outputs.last_hidden_state.mean(dim=1)
+                    embeddings_batch = embeddings_batch.cpu().numpy()
+                    embeddings.append(embeddings_batch)
+            
+            return np.vstack(embeddings)
+            
+        except Exception as e:
+            logger.error(f"Failed to get training model embeddings: {e}")
+            logger.info("Falling back to sentence transformer")
+            return self._get_sentence_transformer_embeddings(texts)
+    
+    def _get_sentence_transformer_embeddings(self, texts: List[str]) -> np.ndarray:
+        """Fallback to sentence transformers."""
+        if not SENTENCE_TRANSFORMERS_AVAILABLE:
+            raise ImportError("sentence-transformers not available")
+            
+        if not hasattr(self, 'embedding_model'):
+            self.embedding_model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
+            
+        return self.embedding_model.encode(texts, show_progress_bar=True)
     
     def select_by_centroid(self, dataset: Dataset, n_select: int) -> List[int]:
         """Select samples closest to dataset centroid."""
@@ -59,7 +109,10 @@ class QuickEmbeddingSelector:
         # Generate embeddings for all texts
         texts = dataset['text']
         logger.info("Generating embeddings...")
-        embeddings = self.model.encode(texts, show_progress_bar=True, batch_size=32)
+        if self.use_training_model:
+            embeddings = self._get_training_model_embeddings(texts)
+        else:
+            embeddings = self._get_sentence_transformer_embeddings(texts)
         
         # Calculate dataset centroid
         centroid = np.mean(embeddings, axis=0)
@@ -84,7 +137,10 @@ class QuickEmbeddingSelector:
         logger.info(f"Selecting {n_select} samples using {n_clusters} clusters")
         
         texts = dataset['text']
-        embeddings = self.model.encode(texts, show_progress_bar=True, batch_size=32)
+        if self.use_training_model:
+            embeddings = self._get_training_model_embeddings(texts)
+        else:
+            embeddings = self._get_sentence_transformer_embeddings(texts)
         
         # Perform clustering
         kmeans = KMeans(n_clusters=n_clusters, random_state=42)
@@ -124,7 +180,10 @@ class QuickEmbeddingSelector:
         logger.info(f"Selecting {n_select} samples by diversity sampling")
         
         texts = dataset['text']
-        embeddings = self.model.encode(texts, show_progress_bar=True, batch_size=32)
+        if self.use_training_model:
+            embeddings = self._get_training_model_embeddings(texts)
+        else:
+            embeddings = self._get_sentence_transformer_embeddings(texts)
         
         # Start with a random sample
         selected_indices = [np.random.randint(0, len(embeddings))]

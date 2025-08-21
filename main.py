@@ -47,15 +47,15 @@ class QuickExperimentRunner:
     def __init__(self):
         # Import modules (with error handling)
         try:
-            from utils.data_loader import BillSumLoader
-            from data_selection.random_baseline import RandomSelector
-            from data_selection.heuristic_methods import QuickHeuristicSelector
-            from training.peft_trainer import QuickPEFTTrainer
-            from training.evaluation import ComprehensiveEvaluator
+            from src.utils.data_loader import BillSumLoader
+            from src.data_selection.random_baseline import RandomSelector
+            from src.data_selection.heuristic_methods import QuickHeuristicSelector
+            from src.training.simple_trainer import QuickPEFTTrainer
+            from src.training.simple_evaluation import SimpleEvaluator
             
             self.data_loader = BillSumLoader()
             self.trainer = QuickPEFTTrainer()
-            self.evaluator = ComprehensiveEvaluator(self.trainer.model_name, use_comprehensive_metrics=True)
+            self.evaluator = SimpleEvaluator(self.trainer.model_name, use_comprehensive_metrics=True)
             self.random_selector = RandomSelector
             self.heuristic_selector = QuickHeuristicSelector
             
@@ -65,28 +65,196 @@ class QuickExperimentRunner:
             sys.exit(1)
         
         # Initialize wandb if available
+        global WANDB_AVAILABLE
         if WANDB_AVAILABLE and os.getenv("WANDB_API_KEY"):
             try:
-                wandb.login(key=os.getenv("WANDB_API_KEY"))
-                logger.info("Wandb initialized successfully")
+                # Check if already logged in, if not login
+                if not wandb.login(key=os.getenv("WANDB_API_KEY"), relogin=False):
+                    logger.warning("WandB login failed - experiment tracking disabled")
+                    WANDB_AVAILABLE = False
+                else:
+                    logger.info("WandB initialized successfully")
             except Exception as e:
-                logger.warning(f"Failed to initialize wandb: {e}")
+                logger.warning(f"Failed to initialize WandB: {e}")
+                logger.warning("Experiment tracking disabled")
+                # Disable wandb for this session
+                WANDB_AVAILABLE = False
     
     def validate_environment(self) -> bool:
-        """Validate that all required environment variables are set."""
-        required_vars = ["HF_TOKEN"]
-        missing_vars = []
+        """Validate environment and prompt for tokens interactively."""
+        logger.info("🔍 Validating environment setup...")
         
-        for var in required_vars:
-            if not os.getenv(var):
-                missing_vars.append(var)
+        # Check if .env exists, create if not
+        if not os.path.exists('.env'):
+            logger.info("📝 Creating .env file from template...")
+            import shutil
+            shutil.copy('.env.template', '.env')
         
-        if missing_vars:
-            logger.error(f"Missing required environment variables: {missing_vars}")
-            logger.error("Please copy .env.template to .env and fill in your tokens")
+        # Interactive token input (safer than storing in files)
+        hf_token = os.getenv('HF_TOKEN')
+        
+        # Check if token is placeholder or empty
+        if not hf_token or hf_token == 'your_huggingface_token_here' or hf_token.startswith('hf_dummy'):
+            print("\n🔑 HuggingFace Token Required")
+            print("This is needed to download models and datasets.")
+            print("Get your token from: https://huggingface.co/settings/tokens")
+            hf_token = input("Enter your HuggingFace token (or press Enter to skip): ").strip()
+            
+            if hf_token:
+                # Set for current session only (don't save to file)
+                os.environ['HF_TOKEN'] = hf_token
+                logger.info("✅ HuggingFace token set for this session")
+            else:
+                logger.warning("⚠️  No HuggingFace token provided - some features may not work")
+        else:
+            logger.info("✅ HuggingFace token found")
+        
+        # Optional WandB token
+        wandb_token = os.getenv('WANDB_API_KEY')
+        if not wandb_token or wandb_token == 'your_wandb_key_here':
+            print("\n📊 WandB API Key (Optional)")
+            print("This enables experiment tracking and visualization.")
+            print("Get your key from: https://wandb.ai/authorize")
+            wandb_token = input("Enter your WandB API key (or press Enter to skip): ").strip()
+            
+            if wandb_token:
+                os.environ['WANDB_API_KEY'] = wandb_token
+                logger.info("✅ WandB API key set for this session")
+            else:
+                logger.info("ℹ️  WandB tracking disabled - experiment tracking will be local only")
+        else:
+            logger.info("✅ WandB API key found")
+        
+        # Test basic imports
+        try:
+            logger.info("🧪 Testing core dependencies...")
+            import torch
+            import transformers
+            import datasets
+            logger.info(f"✅ PyTorch: {torch.__version__}")
+            logger.info(f"✅ Transformers: {transformers.__version__}")
+            logger.info(f"✅ Datasets: {datasets.__version__}")
+        except ImportError as e:
+            logger.error(f"❌ Dependency error: {e}")
             return False
         
+        # Test our custom modules
+        try:
+            logger.info("🧪 Testing pipeline components...")
+            from src.utils.metrics import MetricsCalculator
+            calc = MetricsCalculator(device='cpu')
+            logger.info("✅ Metrics calculator working")
+            
+            # Quick test
+            test_pred = ["The bill establishes new standards."]
+            test_ref = ["This legislation creates new regulations."]
+            metrics = calc.calculate_all_metrics(test_pred, test_ref)
+            logger.info(f"✅ Sample ROUGE-L: {metrics.get('rougeL_avg', 0):.3f}")
+            logger.info(f"✅ Sample BERTScore: {metrics.get('bert_score_f1', 0):.3f}")
+            
+        except Exception as e:
+            logger.error(f"❌ Pipeline component error: {e}")
+            return False
+        
+        logger.info("✅ Environment validation completed successfully!")
+        print("\n🎉 Setup Complete! You can now run:")
+        print("   python main.py --mode quick    # 2-3 hour experiment")
+        print("   python main.py --mode full     # Complete experiment")
+        
         return True
+    
+    def evaluate_base_model(self, test_data, num_samples=50) -> dict:
+        """Evaluate the base model with zero-shot prompting."""
+        logger.info("=== EVALUATING BASE MODEL (FEW-SHOT) ===")
+        
+        try:
+            from transformers import AutoTokenizer, AutoModelForCausalLM
+            import torch
+            from src.utils.metrics import MetricsCalculator
+            
+            # Load base model
+            model_name = self.trainer.model_name
+            logger.info(f"Loading base model: {model_name}")
+            
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+                
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.float16,
+                device_map="auto"
+            )
+            model.eval()
+            
+            # Take a sample of test data
+            sample_data = test_data.select(range(min(num_samples, len(test_data))))
+            
+            predictions = []
+            references = []
+            
+            logger.info(f"Generating summaries for {len(sample_data)} samples...")
+            
+            for i, example in enumerate(sample_data):
+                if i % 10 == 0:
+                    logger.info(f"Progress: {i}/{len(sample_data)}")
+                
+                # Create zero-shot prompt
+                prompt = f"""Summarize the following bill text in one concise sentence:
+
+Bill: {example['text'][:1000]}...
+
+Summary:"""
+                
+                # Generate
+                inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
+                inputs = {k: v.to(model.device) for k, v in inputs.items()}
+                
+                with torch.no_grad():
+                    outputs = model.generate(
+                        **inputs,
+                        max_new_tokens=50,
+                        temperature=0.7,
+                        do_sample=False,
+                        pad_token_id=tokenizer.eos_token_id
+                    )
+                
+                # Extract generated text
+                generated = tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
+                prediction = generated.split('\n')[0].strip()
+                
+                predictions.append(prediction)
+                references.append(example['summary'])
+            
+            # Calculate metrics
+            metrics_calc = MetricsCalculator(device='cpu')
+            metrics = metrics_calc.calculate_all_metrics(predictions, references)
+            
+            # Clean up memory
+            del model
+            torch.cuda.empty_cache()
+            
+            logger.info(f"Base Model Performance:")
+            logger.info(f"  ROUGE-L: {metrics.get('rougeL_avg', 0):.4f}")
+            logger.info(f"  BERTScore-F1: {metrics.get('bert_score_f1', 0):.4f}")
+            
+            return {
+                'method': 'base_model',
+                'rouge_l': metrics.get('rougeL_avg', 0),
+                'bert_score_f1': metrics.get('bert_score_f1', 0),
+                'samples': len(sample_data),
+                'model_name': model_name
+            }
+            
+        except Exception as e:
+            logger.error(f"Base model evaluation failed: {e}")
+            return {
+                'method': 'base_model',
+                'rouge_l': 0.0,
+                'bert_score_f1': 0.0,
+                'samples': 0,
+                'error': str(e)
+            }
     
     def run_full_baseline(self) -> dict:
         """Run full dataset baseline first."""
@@ -109,12 +277,18 @@ class QuickExperimentRunner:
             "model": self.trainer.model_name
         }
         
+        wandb_run = None
         if WANDB_AVAILABLE and os.getenv("WANDB_API_KEY"):
-            run = wandb.init(
-                project=os.getenv("WANDB_PROJECT", "billsum-kd-benchmark"),
-                name="full_dataset_baseline",
-                config=run_config
-            )
+            try:
+                wandb_run = wandb.init(
+                    project=os.getenv("WANDB_PROJECT", "billsum-kd-benchmark"),
+                    name="full_dataset_baseline",
+                    config=run_config
+                )
+                logger.info(f"WandB run initialized: {wandb_run.name}")
+            except Exception as e:
+                logger.warning(f"Failed to initialize WandB run: {e}")
+                logger.warning("Continuing without WandB logging...")
         
         # Train on full dataset
         output_dir = "results/full_baseline"
@@ -131,9 +305,17 @@ class QuickExperimentRunner:
             results = self.evaluator.quick_evaluate(output_dir, test_data, max_samples=200)
             
             # Log results
-            if WANDB_AVAILABLE and os.getenv("WANDB_API_KEY"):
-                wandb.log(results)
-                wandb.finish()
+            if wandb_run is not None:
+                try:
+                    wandb.log(results)
+                    wandb.finish()
+                    logger.info("Results logged to WandB successfully")
+                except Exception as e:
+                    logger.warning(f"Failed to log results to WandB: {e}")
+                    try:
+                        wandb.finish()
+                    except:
+                        pass
             
             # Save results
             full_results = {
@@ -170,12 +352,18 @@ class QuickExperimentRunner:
             "model": self.trainer.model_name
         }
         
+        wandb_run = None
         if WANDB_AVAILABLE and os.getenv("WANDB_API_KEY"):
-            run = wandb.init(
-                project=os.getenv("WANDB_PROJECT", "billsum-kd-benchmark"),
-                name=f"{method_name}_10percent",
-                config=run_config
-            )
+            try:
+                wandb_run = wandb.init(
+                    project=os.getenv("WANDB_PROJECT", "billsum-kd-benchmark"),
+                    name=f"{method_name}_10percent",
+                    config=run_config
+                )
+                logger.info(f"WandB run initialized: {wandb_run.name}")
+            except Exception as e:
+                logger.warning(f"Failed to initialize WandB run: {e}")
+                logger.warning("Continuing without WandB logging...")
         
         start_time = time.time()
         
@@ -205,9 +393,17 @@ class QuickExperimentRunner:
             results = self.evaluator.quick_evaluate(output_dir, test_data, max_samples=200)
             
             # Log results
-            if WANDB_AVAILABLE and os.getenv("WANDB_API_KEY"):
-                wandb.log({**results, "selection_time": selection_time})
-                wandb.finish()
+            if wandb_run is not None:
+                try:
+                    wandb.log({**results, "selection_time": selection_time})
+                    wandb.finish()
+                    logger.info("Results logged to WandB successfully")
+                except Exception as e:
+                    logger.warning(f"Failed to log results to WandB: {e}")
+                    try:
+                        wandb.finish()
+                    except:
+                        pass
             
             # Save results
             method_results = {
@@ -247,6 +443,31 @@ class QuickExperimentRunner:
         
         results = {}
         
+        # Base model evaluation (use existing results if available)
+        logger.info("Checking for existing base model results...")
+        base_results_file = "results/base_model_fewshot_1shot/results_base_model.json"
+        if os.path.exists(base_results_file):
+            logger.info("Using existing base model evaluation results...")
+            with open(base_results_file, 'r') as f:
+                base_results = json.load(f)
+            results['base_model'] = {
+                'method': 'base_model_fewshot',
+                'rouge_l': base_results.get('rougeL', 0.0),
+                'bert_score_f1': base_results.get('bertscore_f1', 0.0),
+                'samples': 100,
+                'model_name': self.trainer.model_name
+            }
+            logger.info(f"Base model - ROUGE-L: {results['base_model']['rouge_l']:.4f}")
+        else:
+            logger.info("No existing base model results found, skipping for memory efficiency...")
+            results['base_model'] = {
+                'method': 'base_model_skipped',
+                'rouge_l': 0.0,
+                'bert_score_f1': 0.0,
+                'samples': 0,
+                'note': 'Skipped due to memory constraints'
+            }
+        
         # Random baseline
         results['random'] = self.run_selection_method(
             "random",
@@ -271,7 +492,7 @@ class QuickExperimentRunner:
         
         # Try embedding methods if available
         try:
-            from data_selection.embedding_methods import QuickEmbeddingSelector
+            from src.data_selection.embedding_methods import QuickEmbeddingSelector
             embedding_selector = QuickEmbeddingSelector()
             
             results['embedding_centroid'] = self.run_selection_method(
@@ -345,7 +566,7 @@ class QuickExperimentRunner:
         
         # 6. Embedding centroid (with model consistency)
         try:
-            from data_selection.embedding_methods import QuickEmbeddingSelector
+            from src.data_selection.embedding_methods import QuickEmbeddingSelector
             embedding_selector = QuickEmbeddingSelector(model_name=self.trainer.model_name)
             
             # First try with training model consistency
@@ -378,7 +599,7 @@ class QuickExperimentRunner:
         
         # 6. Iterative method
         try:
-            from data_selection.iterative_method import IterativeSelector
+            from src.data_selection.iterative_method import IterativeSelector
             iterative_selector = IterativeSelector()
             all_results['iterative'] = self.run_selection_method(
                 "iterative",
