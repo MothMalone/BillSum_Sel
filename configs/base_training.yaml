@@ -1,0 +1,48 @@
+# Base training configuration for all experiments
+# Shared settings optimized for quick iteration
+
+model:
+  name: "meta-llama/Llama-2-7b-hf"
+  use_auth_token: true
+  torch_dtype: "float16"
+  device_map: "auto"
+  load_in_8bit: true
+
+lora:
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.1
+  target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
+  task_type: "CAUSAL_LM"
+
+training:
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 4
+  warmup_steps: 100
+  learning_rate: 2e-4
+  logging_steps: 10
+  save_steps: 500
+  eval_steps: 500
+  save_total_limit: 2
+  fp16: true
+  dataloader_num_workers: 0
+  dataloader_pin_memory: false
+
+tokenization:
+  max_length: 2048
+  padding_side: "left"
+  truncation: true
+
+generation:
+  max_new_tokens: 200
+  temperature: 0.7
+  do_sample: true
+
+evaluation:
+  max_samples: 200
+  metrics: ["rouge1", "rouge2", "rougeL"]
+  use_stemmer: true
+
+logging:
+  report_to: "wandb"
+  project: "billsum-kd-benchmark"

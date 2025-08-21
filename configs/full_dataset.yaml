@@ -1,0 +1,32 @@
+# Full dataset baseline configuration
+# Establishes performance ceiling with complete training data
+
+experiment:
+  name: "full_dataset_baseline"
+  description: "Complete BillSum dataset training to establish performance ceiling"
+  
+dataset:
+  name: "MothMalone/SLMS-KD-Benchmarks"
+  subset: "billsum"
+  use_full_train: true
+  max_train_samples: null  # Use all available
+  
+training:
+  num_train_epochs: 2  # More epochs for baseline
+  per_device_train_batch_size: 2  # Smaller batch for memory with full data
+  gradient_accumulation_steps: 8  # Compensate for smaller batch
+  output_dir: "results/full_baseline"
+  run_name: "full_dataset_baseline"
+  
+selection:
+  method: "none"  # Use all data
+  percentage: 1.0
+  
+evaluation:
+  splits: ["test", "ca_test"]
+  max_samples: 500  # More thorough evaluation for baseline
+  
+notes: |
+  This configuration trains on the complete BillSum dataset to establish
+  the performance ceiling. Results from this run serve as the comparison
+  baseline for all data selection methods.

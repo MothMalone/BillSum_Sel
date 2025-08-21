@@ -1,0 +1,93 @@
+# Data selection methods configuration
+# Defines all 10% selection strategies for comparison
+
+selection_percentage: 0.1  # Use 10% of training data for all methods
+
+methods:
+  random:
+    class: "RandomSelector"
+    function: "select_random"
+    params:
+      seed: 42
+    description: "Random baseline - uniform sampling"
+    
+  stratified_random:
+    class: "RandomSelector" 
+    function: "select_stratified_random"
+    params:
+      length_bins: 5
+      seed: 42
+    description: "Stratified random by text length"
+    
+  optimal_length:
+    class: "QuickHeuristicSelector"
+    function: "select_by_optimal_length"
+    params:
+      min_words: 200
+      max_words: 800
+    description: "Select documents in optimal length range"
+    
+  diversity:
+    class: "QuickHeuristicSelector"
+    function: "select_by_diversity"
+    params: {}
+    description: "High lexical diversity selection"
+    
+  length_diversity:
+    class: "QuickHeuristicSelector"
+    function: "select_length_diversity_combo"
+    params: {}
+    description: "Combined length filtering + diversity selection"
+    
+  summary_ratio:
+    class: "QuickHeuristicSelector"
+    function: "select_by_summary_length_ratio"
+    params:
+      optimal_ratio_min: 0.05
+      optimal_ratio_max: 0.20
+    description: "Optimal text-to-summary length ratio"
+    
+  embedding_centroid:
+    class: "QuickEmbeddingSelector"
+    function: "select_by_centroid"
+    params:
+      model_name: "all-MiniLM-L6-v2"
+    description: "Closest to dataset semantic centroid"
+    
+  clustering:
+    class: "QuickEmbeddingSelector"
+    function: "select_by_clustering"
+    params:
+      model_name: "all-MiniLM-L6-v2"
+      n_clusters: null  # Auto-calculated
+    description: "Representative samples from semantic clusters"
+    
+  diversity_sampling:
+    class: "QuickEmbeddingSelector"
+    function: "select_by_diversity_sampling" 
+    params:
+      model_name: "all-MiniLM-L6-v2"
+    description: "Maximum semantic diversity sampling"
+    
+  iterative_pruning:
+    class: "IterativePruningSelector"
+    function: "select_by_d2_pruning"
+    params:
+      model_name: "all-MiniLM-L6-v2"
+      initial_factor: 2.0
+      iterations: 3
+    description: "Iterative D2-based pruning"
+
+# Quick experiment subset (for 30-min test)
+quick_methods: ["random", "length_diversity", "embedding_centroid"]
+
+# Training configuration for each method
+training_overrides:
+  num_train_epochs: 1  # Single epoch for speed
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 4
+  
+# Evaluation settings
+evaluation:
+  max_samples: 200  # Quick evaluation
+  metrics: ["rouge1", "rouge2", "rougeL"]
