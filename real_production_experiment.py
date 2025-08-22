@@ -96,29 +96,25 @@ def load_dataset():
         return None, None
 
 class MemoryOptimizedPEFTTrainer:
-    """Memory-optimized PEFT trainer for high-end GPU."""
+    """PEFT trainer optimized for 16GB GPU memory constraints."""
     
-    def __init__(self, base_model_name: str = "meta-llama/Llama-2-7b-hf"):
-        self.base_model_name = base_model_name
-        self.model = None
-        self.tokenizer = None
-        
-        # Optimized settings for high-end GPU
+    def __init__(self):
+        self.model_name = "meta-llama/Llama-2-7b-hf"  # LLaMA-2-7B model
         self.config = {
-            "max_length": 1024,          # Reduced for stability
-            "batch_size": 1,             # Conservative batch size
-            "gradient_accumulation": 8,  # Increased accumulation
-            "learning_rate": 2e-4,
-            "num_epochs": 1,             # Single epoch for efficiency
-            "lora_r": 16,                # Higher LoRA rank for better quality
+            "lora_r": 8,
             "lora_alpha": 32,
             "lora_dropout": 0.1,
-            "bf16": True,                # Use bf16 for memory efficiency
+            "max_length": 1024,
+            "batch_size": 1,
+            "gradient_accumulation_steps": 8,
+            "learning_rate": 2e-4,
+            "num_epochs": 1,
+            "warmup_steps": 10
         }
     
     def setup_model_and_tokenizer(self):
         """Setup model and tokenizer with memory optimization."""
-        logger.info(f"Loading model: {self.base_model_name}")
+        logger.info(f"Loading model: {self.model_name}")
         
         try:
             from transformers import (
@@ -140,33 +136,26 @@ class MemoryOptimizedPEFTTrainer:
             )
             
             # Load tokenizer
-            self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_name)
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
-            # Add padding side for training  
-            self.tokenizer.padding_side = "right"
             
             # Load model with quantization
             self.model = AutoModelForCausalLM.from_pretrained(
-                self.base_model_name,
+                self.model_name,
                 quantization_config=bnb_config,
                 device_map="auto",
                 torch_dtype=torch.bfloat16,
                 trust_remote_code=True
             )
             
-            # Prepare model for k-bit training (required for quantized models)
-            from peft import prepare_model_for_kbit_training
-            self.model = prepare_model_for_kbit_training(self.model)
-            
-            # Setup LoRA for LLaMA-2
+            # Setup LoRA
             lora_config = LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
                 r=self.config["lora_r"],
                 lora_alpha=self.config["lora_alpha"],
                 lora_dropout=self.config["lora_dropout"],
-                target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-                bias="none"
+                target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
             )
             
             self.model = get_peft_model(self.model, lora_config)
@@ -191,48 +180,46 @@ class MemoryOptimizedPEFTTrainer:
             text = example.get('text', '').strip()
             summary = example.get('summary', '').strip()
             
-            # Truncate text if too long (increased for LLaMA-2)
-            text_words = text.split()[:500]  # Limit to ~500 words for better context
+            # Truncate text if too long
+            text_words = text.split()[:300]  # Limit to ~300 words
             text = ' '.join(text_words)
             
-            # Create instruction format for LLaMA-2
-            prompt = f"<s>[INST] Summarize the following bill in a concise manner:\n\n{text}\n\nProvide a brief summary: [/INST]"
-            target = f"{summary}</s>"
+            # Create instruction format
+            prompt = f"Summarize the following bill:\n\n{text}\n\nSummary:"
+            target = f"{summary}"
             
-            # Combine full text
-            full_text = prompt + target
-            
-            # Tokenize the full sequence
-            tokenized = self.tokenizer(
-                full_text,
-                max_length=self.config["max_length"],
-                truncation=True,
-                padding=False,
-                return_tensors=None
-            )
-            
-            # Create labels (only train on the summary part)
-            prompt_tokenized = self.tokenizer(
+            # Tokenize
+            model_inputs = self.tokenizer(
                 prompt,
-                max_length=self.config["max_length"],
+                max_length=self.config["max_length"] - 100,  # Reserve space for summary
                 truncation=True,
                 padding=False,
                 return_tensors=None
             )
             
-            input_ids = tokenized["input_ids"]
-            labels = [-100] * len(prompt_tokenized["input_ids"]) + input_ids[len(prompt_tokenized["input_ids"]):]
+            # Tokenize target
+            target_inputs = self.tokenizer(
+                target,
+                max_length=100,
+                truncation=True,
+                padding=False,
+                return_tensors=None
+            )
             
-            # Ensure labels and input_ids have same length
-            if len(labels) > len(input_ids):
-                labels = labels[:len(input_ids)]
-            elif len(labels) < len(input_ids):
-                labels.extend([-100] * (len(input_ids) - len(labels)))
+            # Combine input and target
+            input_ids = model_inputs["input_ids"] + target_inputs["input_ids"]
+            labels = [-100] * len(model_inputs["input_ids"]) + target_inputs["input_ids"]
+            
+            # Pad/truncate to max_length
+            max_len = self.config["max_length"]
+            if len(input_ids) > max_len:
+                input_ids = input_ids[:max_len]
+                labels = labels[:max_len]
             
             return {
                 "input_ids": input_ids,
                 "labels": labels,
-                "attention_mask": tokenized["attention_mask"]
+                "attention_mask": [1] * len(input_ids)
             }
         
         formatted_dataset = dataset.map(format_sample, remove_columns=dataset.column_names)
@@ -272,12 +259,10 @@ class MemoryOptimizedPEFTTrainer:
                 run_name=f"{method_name}_peft_training"
             )
             
-            # Data collator with proper padding
-            from transformers import DataCollatorForSeq2Seq
-            data_collator = DataCollatorForSeq2Seq(
+            # Data collator
+            data_collator = DataCollatorForLanguageModeling(
                 tokenizer=self.tokenizer,
-                model=self.model,
-                label_pad_token_id=-100,
+                mlm=False,
                 pad_to_multiple_of=8
             )
             
@@ -305,7 +290,7 @@ class MemoryOptimizedPEFTTrainer:
             # Save training metadata
             metadata = {
                 "method": method_name,
-                "model": self.base_model_name,
+                "model": self.model_name,
                 "dataset_size": len(formatted_dataset),
                 "training_time": training_time,
                 "config": self.config,
@@ -340,12 +325,10 @@ class MemoryOptimizedPEFTTrainer:
             }
 
 class ProductionEvaluator:
-    """Production evaluator using actual model inference."""
+    """Production evaluator with real model inference."""
     
-    def __init__(self, base_model_name: str = "meta-llama/Llama-2-7b-hf"):
-        self.base_model_name = base_model_name
-        self.model = None
-        self.tokenizer = None
+    def __init__(self):
+        self.model_name = "meta-llama/Llama-2-7b-hf"  # LLaMA-2-7B model
     
     def load_trained_model(self, model_path: str):
         """Load trained PEFT model."""
@@ -365,15 +348,13 @@ class ProductionEvaluator:
             )
             
             # Load tokenizer
-            self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_name)
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
-            # Set padding side for inference
-            self.tokenizer.padding_side = "left"
             
             # Load base model
             base_model = AutoModelForCausalLM.from_pretrained(
-                self.base_model_name,
+                self.model_name,
                 quantization_config=bnb_config,
                 device_map="auto",
                 torch_dtype=torch.bfloat16,
@@ -394,11 +375,11 @@ class ProductionEvaluator:
     def generate_summary(self, text: str) -> str:
         """Generate summary using the trained model."""
         try:
-            prompt = f"<s>[INST] Summarize the following bill in a concise manner:\n\n{text}\n\nProvide a brief summary: [/INST]"
+            prompt = f"Summarize the following bill:\n\n{text}\n\nSummary:"
             
             inputs = self.tokenizer(
                 prompt,
-                max_length=1200,         # Increased input length
+                max_length=800,
                 truncation=True,
                 return_tensors="pt"
             ).to(self.model.device)
@@ -406,7 +387,7 @@ class ProductionEvaluator:
             with torch.no_grad():
                 outputs = self.model.generate(
                     **inputs,
-                    max_new_tokens=200,      # Increased output length
+                    max_new_tokens=150,
                     do_sample=True,
                     temperature=0.7,
                     top_p=0.9,
@@ -416,14 +397,11 @@ class ProductionEvaluator:
             # Decode output
             generated = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
             
-            # Extract summary (after [/INST])
-            if "[/INST]" in generated:
-                summary = generated.split("[/INST]")[-1].strip()
+            # Extract summary (after "Summary:")
+            if "Summary:" in generated:
+                summary = generated.split("Summary:")[-1].strip()
             else:
                 summary = generated[len(prompt):].strip()
-            
-            # Remove any trailing </s> tokens
-            summary = summary.replace("</s>", "").strip()
             
             return summary
             
@@ -629,9 +607,9 @@ def run_production_experiment():
         logger.error("❌ Failed to load dataset")
         return False
     
-    # Experiment configuration for high-end GPU
-    n_train_samples = 50   # Start smaller for testing
-    n_eval_samples = 20    # Reduced for faster testing
+    # Experiment configuration
+    n_train_samples = 100  # Small for demonstration
+    n_eval_samples = 20
     
     # Data selection methods
     methods = [

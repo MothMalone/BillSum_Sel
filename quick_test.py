@@ -58,7 +58,7 @@ def test_model_loading():
     
     try:
         # Test tokenizer
-        tokenizer = AutoTokenizer.from_pretrained("microsoft/DialoGPT-medium")
+        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         logger.info("✅ Tokenizer loaded")
@@ -75,7 +75,7 @@ def test_model_loading():
         
         logger.info("🔧 Loading model with 4-bit quantization...")
         model = AutoModelForCausalLM.from_pretrained(
-            "microsoft/DialoGPT-medium",
+            "meta-llama/Llama-2-7b-hf",
             quantization_config=bnb_config,
             device_map="auto",
             torch_dtype=torch.bfloat16,
@@ -133,7 +133,7 @@ def test_peft_setup():
             r=8,
             lora_alpha=32,
             lora_dropout=0.1,
-            target_modules=["c_attn", "c_proj"]
+            target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
         )
         logger.info("✅ LoRA configuration created")
         
