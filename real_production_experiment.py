@@ -100,6 +100,8 @@ class MemoryOptimizedPEFTTrainer:
     
     def __init__(self):
         self.model_name = "meta-llama/Llama-2-7b-hf"  # LLaMA-2-7B model
+        self.model = None  # Initialize model attribute
+        self.tokenizer = None  # Initialize tokenizer attribute
         self.config = {
             "lora_r": 8,
             "lora_alpha": 32,
@@ -109,7 +111,8 @@ class MemoryOptimizedPEFTTrainer:
             "gradient_accumulation_steps": 8,
             "learning_rate": 2e-4,
             "num_epochs": 1,
-            "warmup_steps": 10
+            "warmup_steps": 10,
+            "bf16": True  # Enable bf16 for memory efficiency
         }
     
     def setup_model_and_tokenizer(self):
@@ -155,11 +158,18 @@ class MemoryOptimizedPEFTTrainer:
                 r=self.config["lora_r"],
                 lora_alpha=self.config["lora_alpha"],
                 lora_dropout=self.config["lora_dropout"],
-                target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+                target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                bias="none",
+                inference_mode=False,  # Ensure we're in training mode
             )
             
             self.model = get_peft_model(self.model, lora_config)
             self.model.print_trainable_parameters()
+            
+            # Ensure model is in training mode and enable gradient computation
+            self.model.train()
+            # Remove the enable_adapters() call - it's causing issues
+            # The LoRA adapters are already enabled when created with get_peft_model
             
             logger.info("✅ Model and tokenizer loaded successfully")
             return True
@@ -234,7 +244,7 @@ class MemoryOptimizedPEFTTrainer:
             from transformers import TrainingArguments, Trainer, DataCollatorForLanguageModeling
             
             # Setup model if not already done
-            if self.model is None:
+            if self.model is None or self.tokenizer is None:
                 if not self.setup_model_and_tokenizer():
                     raise Exception("Failed to setup model")
             
@@ -245,7 +255,7 @@ class MemoryOptimizedPEFTTrainer:
             training_args = TrainingArguments(
                 output_dir=output_dir,
                 per_device_train_batch_size=self.config["batch_size"],
-                gradient_accumulation_steps=self.config["gradient_accumulation"],
+                gradient_accumulation_steps=self.config["gradient_accumulation_steps"],
                 learning_rate=self.config["learning_rate"],
                 num_train_epochs=self.config["num_epochs"],
                 logging_steps=10,
@@ -274,6 +284,24 @@ class MemoryOptimizedPEFTTrainer:
                 data_collator=data_collator,
                 tokenizer=self.tokenizer,
             )
+            
+            # Ensure model is ready for training
+            self.model.train()
+            # Remove enable_adapters() call here too
+            
+            # Debug: Check if any parameters require gradients
+            trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            total_params = sum(p.numel() for p in self.model.parameters())
+            logger.info(f"📊 Trainable parameters: {trainable_params:,} / {total_params:,}")
+            
+            if trainable_params == 0:
+                logger.error("❌ No trainable parameters found!")
+                return {
+                    "success": False,
+                    "error": "No trainable parameters",
+                    "output_dir": output_dir,
+                    "dataset_size": len(formatted_dataset)
+                }
             
             # Clear memory before training
             clear_gpu_memory()
@@ -329,6 +357,51 @@ class ProductionEvaluator:
     
     def __init__(self):
         self.model_name = "meta-llama/Llama-2-7b-hf"  # LLaMA-2-7B model
+        self.model = None  # Initialize model attribute
+        self.tokenizer = None  # Initialize tokenizer attribute
+    
+    def setup_model_and_tokenizer(self):
+        """Setup base model and tokenizer for evaluation."""
+        logger.info(f"Loading base model: {self.model_name}")
+        
+        try:
+            from transformers import (
+                AutoModelForCausalLM, 
+                AutoTokenizer, 
+                BitsAndBytesConfig
+            )
+            
+            # Clear memory first
+            clear_gpu_memory()
+            
+            # Quantization config for memory efficiency
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+            )
+            
+            # Load tokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+            # Load base model
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_name,
+                quantization_config=bnb_config,
+                device_map="auto",
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True
+            )
+            
+            logger.info("✅ Base model and tokenizer loaded successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to load base model: {e}")
+            return False
     
     def load_trained_model(self, model_path: str):
         """Load trained PEFT model."""
@@ -408,6 +481,104 @@ class ProductionEvaluator:
         except Exception as e:
             logger.error(f"❌ Failed to generate summary: {e}")
             return ""
+    
+    def evaluate_base_model(self, test_dataset, max_samples: int = 20):
+        """Evaluate base model without fine-tuning."""
+        logger.info(f"📊 Evaluating base model (no fine-tuning)")
+        
+        # Setup base model and tokenizer
+        if not self.setup_model_and_tokenizer():
+            return {"error": "Failed to setup base model"}
+        
+        # Sample test data
+        eval_dataset = test_dataset.shuffle(seed=42).select(range(min(max_samples, len(test_dataset))))
+        
+        predictions = []
+        references = []
+        
+        logger.info(f"Generating base model predictions for {len(eval_dataset)} samples...")
+        
+        for i, example in enumerate(eval_dataset):
+            if i % 5 == 0:
+                logger.info(f"Processing sample {i+1}/{len(eval_dataset)}")
+            
+            text = example.get('text', '').strip()
+            reference = example.get('summary', '').strip()
+            
+            if not text or not reference:
+                continue
+            
+            # Generate prediction with base model
+            prediction = self.generate_summary(text)
+            
+            logger.info(f"   📝 Generated prediction length: {len(prediction) if prediction else 0}")
+            
+            if prediction and reference:
+                predictions.append(prediction)
+                references.append(reference)
+            else:
+                logger.warning(f"   ⚠️ Skipping sample - prediction: {bool(prediction)}, reference: {bool(reference)}")
+        
+        logger.info(f"✅ Generated {len(predictions)} base model predictions")
+        
+        # Compute ROUGE metrics (including ROUGE-Lsum)
+        try:
+            from evaluate import load
+            rouge_scorer = load("rouge")
+            
+            rouge_scores = rouge_scorer.compute(
+                predictions=predictions,
+                references=references,
+                use_stemmer=True,
+                rouge_types=["rouge1", "rouge2", "rougeL", "rougeLsum"]
+            )
+            
+            # Compute BERTScore (main metric)
+            logger.info("📊 Computing BERTScore...")
+            try:
+                from bert_score import score
+                P, R, F1 = score(predictions, references, lang="en", verbose=False)
+                bertscore_f1 = F1.mean().item()
+                bertscore_precision = P.mean().item()
+                bertscore_recall = R.mean().item()
+                logger.info(f"📈 BERTScore F1: {bertscore_f1:.4f}")
+            except Exception as e:
+                logger.warning(f"BERTScore computation failed: {e}")
+                bertscore_f1 = 0.0
+                bertscore_precision = 0.0
+                bertscore_recall = 0.0
+            
+            results = {
+                "num_samples": len(predictions),
+                "rouge1": rouge_scores["rouge1"],
+                "rouge2": rouge_scores["rouge2"],
+                "rougeL": rouge_scores["rougeL"],
+                "rougeLsum": rouge_scores.get("rougeLsum", rouge_scores["rougeL"]),  # Main ROUGE metric
+                "bertscore_f1": bertscore_f1,        # Main BERTScore metric
+                "bertscore_precision": bertscore_precision,
+                "bertscore_recall": bertscore_recall,
+                "predictions": predictions[:3],  # Sample predictions
+                "references": references[:3]     # Sample references
+            }
+            
+            logger.info(f"📈 Base Model ROUGE-Lsum: {results['rougeLsum']:.4f}")
+            logger.info(f"📈 Base Model BERTScore F1: {results['bertscore_f1']:.4f}")
+            
+            # Clear memory
+            del self.model, self.tokenizer
+            clear_gpu_memory()
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"❌ Base model evaluation failed: {e}")
+            # Clear memory on error
+            if hasattr(self, 'model'):
+                del self.model
+            if hasattr(self, 'tokenizer'):
+                del self.tokenizer
+            clear_gpu_memory()
+            return {"error": str(e)}
     
     def evaluate(self, model_path: str, test_dataset, max_samples: int = 20):
         """Evaluate trained model."""
@@ -624,7 +795,43 @@ def run_production_experiment():
     
     results = {}
     
-    # Run experiments
+    # Base model evaluation (baseline)
+    logger.info(f"\n{'='*60}")
+    logger.info(f"RUNNING: BASE MODEL EVALUATION (BASELINE)")
+    logger.info(f"{'='*60}")
+    
+    try:
+        start_time = time.time()
+        base_eval_result = evaluator.evaluate_base_model(test_dataset, n_eval_samples)
+        base_eval_time = time.time() - start_time
+        
+        if base_eval_result and "bertscore_f1" in base_eval_result:
+            results["base_model"] = {
+                "method": "base_model",
+                "selection_time": 0.0,  # No selection needed
+                "training_time": 0.0,   # No training
+                "dataset_size": 0,      # No training data
+                "evaluation": base_eval_result,
+                "evaluation_time": base_eval_time
+            }
+            
+            bertscore_f1 = base_eval_result.get('bertscore_f1', 0.0)
+            rougeLsum = base_eval_result.get('rougeLsum', base_eval_result.get('rougeL', 0.0))
+            logger.info(f"✅ Base Model - BERTScore F1: {bertscore_f1:.4f} | ROUGE-Lsum: {rougeLsum:.4f}")
+        else:
+            logger.error("❌ Base model evaluation failed")
+            results["base_model"] = {
+                "method": "base_model",
+                "error": "Base model evaluation failed"
+            }
+    except Exception as e:
+        logger.error(f"❌ Base model evaluation error: {e}")
+        results["base_model"] = {
+            "method": "base_model", 
+            "error": str(e)
+        }
+    
+    # Run fine-tuning experiments
     for method_name, selector_func in methods:
         logger.info(f"\n{'='*60}")
         logger.info(f"RUNNING: {method_name.upper().replace('_', ' ')}")
@@ -725,9 +932,17 @@ def display_results(results: Dict):
         elif "evaluation" in result and "rouge1" in result["evaluation"]:
             eval_data = result["evaluation"]
             print(f"  Status: ✅ SUCCESS")
-            print(f"  Selection Time: {result['selection_time']:.2f}s")
-            print(f"  Training Time: {result['training_time']:.2f}s")
-            print(f"  Dataset Size: {result['dataset_size']}")
+            
+            # Handle base model vs fine-tuned models
+            if method_name == "base_model":
+                print(f"  Type: BASELINE (No fine-tuning)")
+                if "evaluation_time" in result:
+                    print(f"  Evaluation Time: {result['evaluation_time']:.2f}s")
+            else:
+                print(f"  Selection Time: {result['selection_time']:.2f}s")
+                print(f"  Training Time: {result['training_time']:.2f}s")
+                print(f"  Dataset Size: {result['dataset_size']}")
+            
             print(f"  📊 MAIN METRICS:")
             print(f"     🎯 BERTScore F1: {eval_data.get('bertscore_f1', 0.0):.4f} (MAIN)")
             print(f"     🎯 ROUGE-Lsum: {eval_data.get('rougeLsum', eval_data.get('rougeL', 0.0)):.4f} (MAIN)")

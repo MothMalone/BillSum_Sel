@@ -44,7 +44,10 @@ def display_main_metrics_summary(data):
     
     # Results for each method
     for method_name, result in results.items():
-        method_display = method_name.replace("_", "-").title()
+        if method_name == "base_model":
+            method_display = "Base-Model (Baseline)"
+        else:
+            method_display = method_name.replace("_", "-").title()
         
         if "error" in result:
             print(f"{method_display:<20} {'---':<15} {'---':<15} ❌ Failed")
@@ -101,7 +104,10 @@ def display_detailed_comparison(data):
         if "evaluation" not in result or "error" in result:
             continue
             
-        method_display = method_name.replace("_", "-").title()
+        if method_name == "base_model":
+            method_display = "Base-Model (Baseline)"
+        else:
+            method_display = method_name.replace("_", "-").title()
         eval_data = result["evaluation"]
         
         print(f"\n{method_display}:")
@@ -115,8 +121,14 @@ def display_detailed_comparison(data):
             print(f"  📊 BERTScore P:      {eval_data['bertscore_precision']:.4f}")
             print(f"  📊 BERTScore R:      {eval_data['bertscore_recall']:.4f}")
         
-        print(f"  ⏱️  Training Time:    {result.get('training_time', 0.0):.1f}s")
-        print(f"  📦 Dataset Size:     {result.get('dataset_size', 'N/A')}")
+        # Show different info for base model vs fine-tuned
+        if method_name == "base_model":
+            print(f"  🏷️  Type:            Baseline (No fine-tuning)")
+            if "evaluation_time" in result:
+                print(f"  ⏱️  Evaluation Time: {result['evaluation_time']:.1f}s")
+        else:
+            print(f"  ⏱️  Training Time:    {result.get('training_time', 0.0):.1f}s")
+            print(f"  📦 Dataset Size:     {result.get('dataset_size', 'N/A')}")
 
 def main():
     """Main function."""
