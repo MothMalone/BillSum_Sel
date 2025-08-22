@@ -243,10 +243,16 @@ class MemoryOptimizedPEFTTrainer:
         try:
             from transformers import TrainingArguments, Trainer, DataCollatorForLanguageModeling
             
-            # Setup model if not already done
-            if self.model is None or self.tokenizer is None:
-                if not self.setup_model_and_tokenizer():
-                    raise Exception("Failed to setup model")
+            # Force fresh model setup for each training run
+            # This ensures clean LoRA state
+            if hasattr(self, 'model'):
+                del self.model
+                del self.tokenizer
+                clear_gpu_memory()
+            
+            # Setup fresh model for this training
+            if not self.setup_model_and_tokenizer():
+                raise Exception("Failed to setup model")
             
             # Prepare dataset
             formatted_dataset = self.prepare_dataset(train_dataset)
@@ -287,12 +293,21 @@ class MemoryOptimizedPEFTTrainer:
             
             # Ensure model is ready for training
             self.model.train()
-            # Remove enable_adapters() call here too
             
             # Debug: Check if any parameters require gradients
             trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
             total_params = sum(p.numel() for p in self.model.parameters())
             logger.info(f"📊 Trainable parameters: {trainable_params:,} / {total_params:,}")
+            
+            # Debug: Log some specific adapter parameters
+            adapter_count = 0
+            for name, param in self.model.named_parameters():
+                if param.requires_grad and 'lora' in name.lower():
+                    adapter_count += 1
+                    if adapter_count <= 3:  # Log first 3
+                        logger.info(f"   LoRA param: {name}, shape: {param.shape}, requires_grad: {param.requires_grad}")
+            
+            logger.info(f"   Total LoRA parameters found: {adapter_count}")
             
             if trainable_params == 0:
                 logger.error("❌ No trainable parameters found!")
@@ -448,11 +463,12 @@ class ProductionEvaluator:
     def generate_summary(self, text: str) -> str:
         """Generate summary using the trained model."""
         try:
-            prompt = f"Summarize the following bill:\n\n{text}\n\nSummary:"
+            # Use a simpler prompt format for base model
+            prompt = f"Summarize: {text}\n\nSummary:"
             
             inputs = self.tokenizer(
                 prompt,
-                max_length=800,
+                max_length=600,  # Reduced to leave more room for generation
                 truncation=True,
                 return_tensors="pt"
             ).to(self.model.device)
@@ -460,23 +476,40 @@ class ProductionEvaluator:
             with torch.no_grad():
                 outputs = self.model.generate(
                     **inputs,
-                    max_new_tokens=150,
-                    do_sample=True,
-                    temperature=0.7,
-                    top_p=0.9,
-                    pad_token_id=self.tokenizer.eos_token_id
+                    max_new_tokens=100,  # More reasonable length
+                    do_sample=False,     # Use greedy for more consistent output
+                    temperature=1.0,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id
                 )
             
             # Decode output
-            generated = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            full_generated = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
             
-            # Extract summary (after "Summary:")
-            if "Summary:" in generated:
-                summary = generated.split("Summary:")[-1].strip()
-            else:
-                summary = generated[len(prompt):].strip()
+            # Extract summary (after the prompt)
+            generated_part = full_generated[len(prompt):].strip()
             
-            return summary
+            # Clean up the summary - take first few sentences
+            if generated_part:
+                # Split by periods and take first 2-3 sentences
+                sentences = generated_part.split('.')
+                if len(sentences) >= 2:
+                    summary = '. '.join(sentences[:2]).strip()
+                    if summary and not summary.endswith('.'):
+                        summary += '.'
+                else:
+                    summary = generated_part.strip()
+                    
+                # Remove any markdown-style formatting
+                summary = summary.replace('###', '').replace('**', '').strip()
+                
+                # Take first line if it's multi-line
+                if '\n' in summary:
+                    summary = summary.split('\n')[0].strip()
+                    
+                return summary
+            
+            return ""
             
         except Exception as e:
             logger.error(f"❌ Failed to generate summary: {e}")
@@ -520,6 +553,21 @@ class ProductionEvaluator:
                 logger.warning(f"   ⚠️ Skipping sample - prediction: {bool(prediction)}, reference: {bool(reference)}")
         
         logger.info(f"✅ Generated {len(predictions)} base model predictions")
+        
+        # Check if we have any predictions
+        if len(predictions) == 0:
+            logger.error("❌ No valid predictions generated for base model")
+            return {
+                "error": "No valid predictions generated",
+                "bertscore_f1": 0.0,
+                "rouge_scores": {
+                    "rouge1": 0.0,
+                    "rouge2": 0.0,
+                    "rougeL": 0.0,
+                    "rougeLsum": 0.0
+                },
+                "num_predictions": 0
+            }
         
         # Compute ROUGE metrics (including ROUGE-Lsum)
         try:
